@@ -24,6 +24,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address,undefined")
 add_library(engine_lib
     src/order.cpp
     src/orderbook.cpp
+    src/orderbook_opt.cpp
 )
 
 # Tell the compiler where to find header files
@@ -42,6 +43,7 @@ add_subdirectory(third_party/googletest)
 
 add_executable(engine_tests
     tests/test_orderbook.cpp
+    tests/test_orderbook_opt.cpp
 )
 target_link_libraries(engine_tests engine_lib GTest::gtest_main)
 target_include_directories(engine_tests PRIVATE include)

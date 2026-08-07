@@ -245,7 +245,202 @@ static void BM_CancelOrder(benchmark::State& state) {
     }
 }
 BENCHMARK(BM_CancelOrder);
+// ============================================================
+// OPTIMIZED ORDER BOOK BENCHMARKS
+//
+// Same tests as the naive version, using OrderBookOpt.
+// The comparison between naive and optimized numbers is
+// the before/after story for your CV.
+// ============================================================
 
+#include "orderbook_opt.h"
+
+static AlignedOrder make_random_aligned_order(uint64_t id, std::mt19937& rng) {
+    std::uniform_int_distribution<int> side_dist(0, 1);
+    std::uniform_int_distribution<int> price_dist(990, 1010);
+    std::uniform_int_distribution<int> qty_dist(1, 100);
+
+    return AlignedOrder{
+        .id = id,
+        .price = static_cast<double>(price_dist(rng)),
+        .quantity = static_cast<uint32_t>(qty_dist(rng)),
+        .filled = 0,
+        .side = side_dist(rng) == 0 ? Side::Buy : Side::Sell,
+        .type = OrderType::Limit,
+        .active = true,
+        .timestamp = id
+    };
+}
+
+// ============================================================
+// Optimized: Add orders without matching
+// ============================================================
+static void BM_Opt_AddOrderNoMatch(benchmark::State& state) {
+    // Price range 1-200, tick size 1.0 — 200 price levels
+    OrderBookOpt book(1.0, 200.0, 1.0);
+    uint64_t id = 0;
+
+    for (auto _ : state) {
+        book.add_order(AlignedOrder{
+            .id = ++id,
+            .price = 100.0 + static_cast<double>(id % 100),
+            .quantity = 50,
+            .filled = 0,
+            .side = Side::Buy,
+            .type = OrderType::Limit,
+            .active = true,
+            .timestamp = id
+        });
+    }
+
+    state.counters["orders"] = benchmark::Counter(
+        static_cast<double>(id),
+        benchmark::Counter::kIsRate
+    );
+}
+BENCHMARK(BM_Opt_AddOrderNoMatch);
+
+// ============================================================
+// Optimized: Add orders with matching
+// ============================================================
+static void BM_Opt_AddOrderWithMatching(benchmark::State& state) {
+    OrderBookOpt book(900.0, 1100.0, 1.0);
+    uint64_t id = 0;
+    std::mt19937 rng(42);
+
+    for (auto _ : state) {
+        AlignedOrder order = make_random_aligned_order(++id, rng);
+        book.add_order(order);
+    }
+
+    state.counters["orders"] = benchmark::Counter(
+        static_cast<double>(id),
+        benchmark::Counter::kIsRate
+    );
+}
+BENCHMARK(BM_Opt_AddOrderWithMatching);
+
+// ============================================================
+// Optimized: Match against a pre-filled deep book
+// ============================================================
+static void BM_Opt_MatchAgainstDeepBook(benchmark::State& state) {
+    OrderBookOpt book(900.0, 1100.0, 1.0);
+    std::mt19937 rng(42);
+    uint64_t id = 0;
+
+    // Pre-fill: 5000 bids at 950-999, 5000 asks at 1001-1050
+    for (int i = 0; i < 5000; i++) {
+        std::uniform_int_distribution<int> buy_price(950, 999);
+        std::uniform_int_distribution<int> qty(1, 100);
+        book.add_order(AlignedOrder{
+            .id = ++id,
+            .price = static_cast<double>(buy_price(rng)),
+            .quantity = static_cast<uint32_t>(qty(rng)),
+            .filled = 0,
+            .side = Side::Buy,
+            .type = OrderType::Limit,
+            .active = true,
+            .timestamp = id
+        });
+    }
+    for (int i = 0; i < 5000; i++) {
+        std::uniform_int_distribution<int> sell_price(1001, 1050);
+        std::uniform_int_distribution<int> qty(1, 100);
+        book.add_order(AlignedOrder{
+            .id = ++id,
+            .price = static_cast<double>(sell_price(rng)),
+            .quantity = static_cast<uint32_t>(qty(rng)),
+            .filled = 0,
+            .side = Side::Sell,
+            .type = OrderType::Limit,
+            .active = true,
+            .timestamp = id
+        });
+    }
+
+    uint64_t bench_count = 0;
+    for (auto _ : state) {
+        bench_count++;
+        std::uniform_int_distribution<int> side_dist(0, 1);
+
+        if (side_dist(rng) == 0) {
+            book.add_order(AlignedOrder{
+                .id = ++id,
+                .price = 1050.0,
+                .quantity = 1,
+                .filled = 0,
+                .side = Side::Buy,
+                .type = OrderType::Limit,
+                .active = true,
+                .timestamp = id
+            });
+        } else {
+            book.add_order(AlignedOrder{
+                .id = ++id,
+                .price = 950.0,
+                .quantity = 1,
+                .filled = 0,
+                .side = Side::Sell,
+                .type = OrderType::Limit,
+                .active = true,
+                .timestamp = id
+            });
+        }
+    }
+
+    state.counters["orders"] = benchmark::Counter(
+        static_cast<double>(bench_count),
+        benchmark::Counter::kIsRate
+    );
+}
+BENCHMARK(BM_Opt_MatchAgainstDeepBook);
+
+// ============================================================
+// Optimized: Cancel orders — this is where the biggest
+// improvement should be. O(1) lookup vs O(n) linear scan.
+// ============================================================
+static void BM_Opt_CancelOrder(benchmark::State& state) {
+    OrderBookOpt book(1.0, 300.0, 1.0);
+    uint64_t id = 0;
+
+    // Pre-fill with 10,000 buy orders across many price levels
+    for (int i = 0; i < 10000; i++) {
+        book.add_order(AlignedOrder{
+            .id = ++id,
+            .price = 100.0 + static_cast<double>(i % 200),
+            .quantity = 50,
+            .filled = 0,
+            .side = Side::Buy,
+            .type = OrderType::Limit,
+            .active = true,
+            .timestamp = id
+        });
+    }
+
+    uint64_t cancel_id = 5000;
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(book.cancel_order(cancel_id++));
+
+        if (cancel_id > id) {
+            state.PauseTiming();
+            for (int i = 0; i < 10000; i++) {
+                book.add_order(AlignedOrder{
+                    .id = ++id,
+                    .price = 100.0 + static_cast<double>(i % 200),
+                    .quantity = 50,
+                    .filled = 0,
+                    .side = Side::Buy,
+                    .type = OrderType::Limit,
+                    .active = true,
+                    .timestamp = id
+                });
+            }
+            cancel_id = id - 5000;
+            state.ResumeTiming();
+        }
+    }
+}
+BENCHMARK(BM_Opt_CancelOrder);
 // ============================================================
 // This macro generates the main() function for the benchmark.
 // It handles command-line argument parsing (like --benchmark_filter),
