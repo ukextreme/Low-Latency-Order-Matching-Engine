@@ -44,6 +44,7 @@ add_subdirectory(third_party/googletest)
 add_executable(engine_tests
     tests/test_orderbook.cpp
     tests/test_orderbook_opt.cpp
+    tests/test_spsc_queue.cpp
 )
 target_link_libraries(engine_tests engine_lib GTest::gtest_main)
 target_include_directories(engine_tests PRIVATE include)
@@ -60,3 +61,9 @@ add_executable(engine_bench
 )
 target_link_libraries(engine_bench engine_lib benchmark::benchmark)
 target_include_directories(engine_bench PRIVATE include)
+
+add_executable(spsc_bench
+    benchmarks/bench_spsc_queue.cpp
+)
+target_link_libraries(spsc_bench engine_lib benchmark::benchmark)
+target_include_directories(spsc_bench PRIVATE include)
