@@ -145,6 +145,25 @@ private:
     // Update best_ask_index_ after a change to the ask side
     void update_best_ask();
 
+    // === Level occupancy summary ===
+    // Bit i is set when level i holds at least one active order.
+    // The flat array gives O(1) access to a KNOWN price, but finding
+    // the next best occupied level meant walking every level in
+    // between — which is why deep-book matching lost to the naive
+    // std::map, where the best price is just begin(). Scanning 64
+    // levels per word instead makes that step O(levels/64).
+    std::vector<uint64_t> bid_occupied_;
+    std::vector<uint64_t> ask_occupied_;
+
+    static void set_occupied(std::vector<uint64_t>& bm, size_t idx);
+    static void clear_occupied(std::vector<uint64_t>& bm, size_t idx);
+
+    // Both return SIZE_MAX when no occupied level exists that way.
+    static size_t highest_occupied_at_or_below(
+        const std::vector<uint64_t>& bm, size_t start);
+    static size_t lowest_occupied_at_or_above(
+        const std::vector<uint64_t>& bm, size_t start, size_t num_levels);
+
     // === The flat price-level arrays ===
     // One vector for bids, one for asks.
     // Each element is a PriceLevel at that price index.

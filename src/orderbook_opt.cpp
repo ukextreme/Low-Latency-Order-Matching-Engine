@@ -1,6 +1,14 @@
 #include "orderbook_opt.h"
 #include <algorithm>
 
+// Price levels start with zero capacity, so the first pushes walk a
+// 1->2->4->8 reallocation chain, copying 40-byte orders each time. That
+// shows up as a p99 tail on add_order. Reserve once, on first use, so
+// only levels that actually hold orders pay for it.
+namespace {
+constexpr size_t kInitialLevelCapacity = 128;
+}
+
 // ============================================================
 // Constructor: set up the flat price-level arrays
 // ============================================================
@@ -25,10 +33,62 @@ OrderBookOpt::OrderBookOpt(double min_price, double max_price, double tick_size)
         ask_levels_[i] = PriceLevel(price);
     }
 
+    // One bit per level, rounded up to whole 64-bit words.
+    bid_occupied_.assign((num_levels_ + 63) / 64, 0ULL);
+    ask_occupied_.assign((num_levels_ + 63) / 64, 0ULL);
+
     // No valid best bid or ask yet
     // SIZE_MAX is a sentinel meaning "no valid index"
     best_bid_idx_ = SIZE_MAX;
     best_ask_idx_ = SIZE_MAX;
+}
+
+// ============================================================
+// Occupancy bitmap helpers
+// ============================================================
+void OrderBookOpt::set_occupied(std::vector<uint64_t>& bm, size_t idx) {
+    bm[idx >> 6] |= (1ULL << (idx & 63));
+}
+
+void OrderBookOpt::clear_occupied(std::vector<uint64_t>& bm, size_t idx) {
+    bm[idx >> 6] &= ~(1ULL << (idx & 63));
+}
+
+size_t OrderBookOpt::highest_occupied_at_or_below(
+    const std::vector<uint64_t>& bm, size_t start) {
+    size_t word = start >> 6;
+    size_t bit = start & 63;
+
+    // Mask away bits above `start` in the starting word.
+    uint64_t w = bm[word] & ((bit == 63) ? ~0ULL : ((1ULL << (bit + 1)) - 1));
+    while (true) {
+        if (w) {
+            // 63 - clz gives the index of the highest set bit.
+            return (word << 6) + (63 - static_cast<size_t>(__builtin_clzll(w)));
+        }
+        if (word == 0) return SIZE_MAX;
+        word--;
+        w = bm[word];
+    }
+}
+
+size_t OrderBookOpt::lowest_occupied_at_or_above(
+    const std::vector<uint64_t>& bm, size_t start, size_t num_levels) {
+    size_t word = start >> 6;
+    if (word >= bm.size()) return SIZE_MAX;
+    size_t bit = start & 63;
+
+    // Mask away bits below `start` in the starting word.
+    uint64_t w = bm[word] & (~0ULL << bit);
+    while (true) {
+        if (w) {
+            size_t idx = (word << 6) + static_cast<size_t>(__builtin_ctzll(w));
+            return (idx < num_levels) ? idx : SIZE_MAX;
+        }
+        word++;
+        if (word >= bm.size()) return SIZE_MAX;
+        w = bm[word];
+    }
 }
 
 // ============================================================
@@ -85,8 +145,12 @@ std::vector<Trade> OrderBookOpt::add_order(AlignedOrder order) {
             };
 
             // Push to the back of the vector (time priority)
+            if (level.orders.capacity() == 0) {
+                level.orders.reserve(kInitialLevelCapacity);
+            }
             level.orders.push_back(order);
             level.active_count++;
+            set_occupied(bid_occupied_, level_idx);
 
             // Update best bid if this price is better (higher)
             if (best_bid_idx_ == SIZE_MAX || level_idx > best_bid_idx_) {
@@ -102,8 +166,12 @@ std::vector<Trade> OrderBookOpt::add_order(AlignedOrder order) {
                 .order_position = pos
             };
 
+            if (level.orders.capacity() == 0) {
+                level.orders.reserve(kInitialLevelCapacity);
+            }
             level.orders.push_back(order);
             level.active_count++;
+            set_occupied(ask_occupied_, level_idx);
 
             // Update best ask if this price is better (lower)
             if (best_ask_idx_ == SIZE_MAX || level_idx < best_ask_idx_) {
@@ -188,6 +256,7 @@ std::vector<Trade> OrderBookOpt::match_order(AlignedOrder& incoming) {
 
             // If this price level has no active orders, move to next
             if (level.active_count == 0) {
+                clear_occupied(ask_occupied_, best_ask_idx_);
                 update_best_ask();
             } else {
                 break;
@@ -237,6 +306,7 @@ std::vector<Trade> OrderBookOpt::match_order(AlignedOrder& incoming) {
             }
 
             if (level.active_count == 0) {
+                clear_occupied(bid_occupied_, best_bid_idx_);
                 update_best_bid();
             } else {
                 break;
@@ -273,10 +343,13 @@ bool OrderBookOpt::cancel_order(uint64_t order_id) {
             level.active_count--;
         }
 
-        // If this was the last active order at the best bid,
-        // we need to find the new best bid
-        if (level.active_count == 0 && loc.level_index == best_bid_idx_) {
-            update_best_bid();
+        // The level must leave the occupancy map whenever it empties,
+        // not only when it happened to be the best bid.
+        if (level.active_count == 0) {
+            clear_occupied(bid_occupied_, loc.level_index);
+            if (loc.level_index == best_bid_idx_) {
+                update_best_bid();
+            }
         }
     } else {
         PriceLevel& level = ask_levels_[loc.level_index];
@@ -287,8 +360,11 @@ bool OrderBookOpt::cancel_order(uint64_t order_id) {
             level.active_count--;
         }
 
-        if (level.active_count == 0 && loc.level_index == best_ask_idx_) {
-            update_best_ask();
+        if (level.active_count == 0) {
+            clear_occupied(ask_occupied_, loc.level_index);
+            if (loc.level_index == best_ask_idx_) {
+                update_best_ask();
+            }
         }
     }
 
@@ -311,17 +387,19 @@ void OrderBookOpt::update_best_bid() {
     // If current best is invalid, start from the top
     size_t start = (best_bid_idx_ == SIZE_MAX) ? num_levels_ - 1 : best_bid_idx_;
 
-    // Scan downward for the next level with active orders
-    // We use a signed loop variable because we scan to 0
+#ifdef USE_LINEAR_BEST_SCAN
+    // Original linear scan, kept so the A/B benchmark can rebuild it.
     for (int i = static_cast<int>(start); i >= 0; i--) {
         if (bid_levels_[i].active_count > 0) {
             best_bid_idx_ = static_cast<size_t>(i);
             return;
         }
     }
-
-    // No bids at all
     best_bid_idx_ = SIZE_MAX;
+#else
+    // Walk down the occupancy bits, 64 levels per word.
+    best_bid_idx_ = highest_occupied_at_or_below(bid_occupied_, start);
+#endif
 }
 
 // ============================================================
@@ -332,15 +410,18 @@ void OrderBookOpt::update_best_bid() {
 void OrderBookOpt::update_best_ask() {
     size_t start = (best_ask_idx_ == SIZE_MAX) ? 0 : best_ask_idx_;
 
+#ifdef USE_LINEAR_BEST_SCAN
     for (size_t i = start; i < num_levels_; i++) {
         if (ask_levels_[i].active_count > 0) {
             best_ask_idx_ = i;
             return;
         }
     }
-
-    // No asks at all
     best_ask_idx_ = SIZE_MAX;
+#else
+    // Walk up the occupancy bits, 64 levels per word.
+    best_ask_idx_ = lowest_occupied_at_or_above(ask_occupied_, start, num_levels_);
+#endif
 }
 
 // ============================================================
