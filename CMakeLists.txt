@@ -45,6 +45,7 @@ add_executable(engine_tests
     tests/test_orderbook.cpp
     tests/test_orderbook_opt.cpp
     tests/test_spsc_queue.cpp
+    tests/test_differential.cpp
 )
 target_link_libraries(engine_tests engine_lib GTest::gtest_main)
 target_include_directories(engine_tests PRIVATE include)
@@ -67,3 +68,10 @@ add_executable(spsc_bench
 )
 target_link_libraries(spsc_bench engine_lib benchmark::benchmark)
 target_include_directories(spsc_bench PRIVATE include)
+
+# Per-operation latency percentiles (rdtscp), independent of Google Benchmark
+add_executable(latency_histogram
+    benchmarks/latency_histogram.cpp
+)
+target_link_libraries(latency_histogram engine_lib)
+target_include_directories(latency_histogram PRIVATE include)
